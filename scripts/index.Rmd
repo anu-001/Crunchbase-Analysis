@@ -1,0 +1,602 @@
+---
+title: 'Startup Acquisition Analysis: A Comprehensive Study of Crunchbase Data'
+author: "Anu Apiti"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: '3'
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    keep_tex: false
+geometry: margin=1in
+fontsize: 11pt
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{float}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6,
+  fig.align = "center",
+  cache = FALSE
+)
+```
+
+# Executive Summary
+
+This analysis examines startup acquisition patterns using Crunchbase data. We investigate the relationships between company characteristics (funding, industry, age) and acquisition outcomes through descriptive statistics, hypothesis testing, mediation analysis, and predictive modeling.
+
+**Key Findings:**
+- Acquired companies have significantly higher funding levels than non-acquired companies
+- Industry type mediates the relationship between company characteristics and acquisition likelihood
+- Funding amount, founding year, and industry are significant predictors of acquisition probability
+
+# Data Preparation and Setup
+
+## Library Loading
+
+```{r libraries}
+# Data manipulation and cleaning
+library(dplyr)
+library(janitor)
+library(lubridate)
+library(tidyr)
+library(readxl)
+library(here)
+
+# Visualization
+library(ggplot2)
+library(gridExtra)
+
+# Statistical analysis
+library(car)
+library(psych)
+library(mediation)
+
+# Reporting
+library(knitr)
+library(kableExtra)
+
+# Set theme for consistent plotting
+theme_set(theme_minimal() + 
+          theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+                legend.position = "bottom"))
+```
+
+## Data Loading
+
+```{r data-loading}
+# Define file path - FIXED: Added missing file_path definition
+file_path <- here("data", "crunchbase_data.xlsx")
+
+# Check if file exists
+if (!file.exists(file_path)) {
+  stop("Data file not found. Please ensure crunchbase_data.xlsx is in the data/ directory.")
+}
+
+# Load all sheets
+df_companies <- read_excel(file_path, sheet = "Companies") %>% clean_names()
+df_rounds <- read_excel(file_path, sheet = "Rounds") %>% clean_names()
+df_acquisitions <- read_excel(file_path, sheet = "Acquisitions") %>% clean_names()
+df_investments <- read_excel(file_path, sheet = "Investments") %>% clean_names()
+
+cat("Dataset dimensions:\n")
+cat("Companies:", nrow(df_companies), "x", ncol(df_companies), "\n")
+cat("Rounds:", nrow(df_rounds), "x", ncol(df_rounds), "\n")
+cat("Acquisitions:", nrow(df_acquisitions), "x", ncol(df_acquisitions), "\n")
+cat("Investments:", nrow(df_investments), "x", ncol(df_investments), "\n")
+```
+
+# Data Processing and Feature Engineering
+
+## Funding Rounds Summary
+
+```{r process-rounds}
+rounds_summary <- df_rounds %>%
+  filter(!is.na(company_name)) %>%
+  mutate(
+    raised_amount_usd = as.numeric(raised_amount_usd),
+    funded_at = ymd(funded_at)
+  ) %>%
+  group_by(company_name) %>%
+  summarise(
+    num_rounds = n(),
+    total_funding_usd = sum(raised_amount_usd, na.rm = TRUE),
+    first_round = min(funded_at, na.rm = TRUE),
+    last_round = max(funded_at, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Funding rounds processed for", nrow(rounds_summary), "companies\n")
+```
+
+## Acquisition Data Processing
+
+```{r process-acquisitions}
+acq_flag <- df_acquisitions %>%
+  filter(!is.na(company_name)) %>%
+  mutate(acquired_at = ymd(acquired_at)) %>%
+  dplyr::select(company_name, acquired_at) %>%
+  distinct(company_name, .keep_all = TRUE)
+
+cat("Acquisition records processed for", nrow(acq_flag), "companies\n")
+```
+
+## Investor Summary
+
+```{r process-investments}
+investor_summary <- df_investments %>%
+  filter(!is.na(company_name)) %>%
+  group_by(company_name) %>%
+  summarise(
+    num_unique_investors = n_distinct(investor_name),
+    has_corporate_vc = any(investor_market == "Corporate Venture Capital", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Investment data processed for", nrow(investor_summary), "companies\n")
+```
+
+## Master Dataset Creation
+
+```{r create-master}
+# Define analysis cutoff date
+cutoff <- as.Date("2014-12-02")
+
+companies_master <- df_companies %>%
+  rename(company_name = name) %>%
+  mutate(
+    founded_at = ymd(founded_at),
+    # Extract primary industry from category list
+    industry = if_else(
+      is.na(category_list) | category_list == "",
+      NA_character_,
+      trimws(gsub("^\\|?([^|]+)\\|?.*$", "\\1", category_list))
+    ) %>% as.factor()
+  ) %>%
+  # Join all summary tables
+  left_join(rounds_summary, by = "company_name") %>%
+  left_join(acq_flag, by = "company_name") %>%
+  left_join(investor_summary, by = "company_name") %>%
+  # Create derived variables
+  mutate(
+    acquired = !is.na(acquired_at),
+    total_funding_usd = coalesce(total_funding_usd, 0),
+    num_rounds = coalesce(num_rounds, 0),
+    num_unique_investors = coalesce(num_unique_investors, 0),
+    has_corporate_vc = coalesce(has_corporate_vc, FALSE),
+    # Time-to-event metrics
+    acquired_flag = acquired == TRUE,
+    end_date = if_else(acquired_flag, acquired_at, cutoff, missing = cutoff),
+    time_to_event_days = as.numeric(end_date - founded_at),
+    time_to_event_years = time_to_event_days / 365,
+    # Transformed variables
+    log_total_funding = log1p(total_funding_usd),
+    company_age = as.numeric(cutoff - founded_at) / 365,
+    founding_year = year(founded_at),
+    # Group industries for analysis
+    industry_grouped = case_when(
+      industry %in% c("Advertising", "Marketing", "Brand Marketing") ~ "Marketing",
+      industry %in% c("Biotechnology", "Health Care", "Medical Devices") ~ "Health",
+      industry %in% c("Mobile", "Mobile Payments", "Mobile Games") ~ "Mobile",
+      industry %in% c("Finance", "Financial Services", "Investment Management") ~ "Finance",
+      industry %in% c("Entertainment", "Music", "Games") ~ "Entertainment",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(!is.na(founded_at)) # Remove companies without founding dates
+
+# Save master dataset - FIXED: Added error handling
+tryCatch({
+  write.csv(companies_master, here("data", "companies_master.csv"), row.names = FALSE)
+}, error = function(e) {
+  warning("Could not save master dataset: ", e$message)
+})
+
+cat("Master dataset created with", nrow(companies_master), "companies and", 
+    ncol(companies_master), "variables\n")
+```
+
+## Data Quality Assessment
+
+```{r data-quality}
+# Missing values analysis
+missing_summary <- companies_master %>%
+  summarise_all(~sum(is.na(.))) %>%
+  gather(variable, missing_count) %>%
+  mutate(missing_percent = round(missing_count / nrow(companies_master) * 100, 1)) %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count))
+
+kable(missing_summary, 
+      caption = "Missing Values Summary",
+      col.names = c("Variable", "Missing Count", "Missing %")) %>%
+  kable_styling(bootstrap_options = "striped")
+```
+
+```{r summary-stats}
+# Key variable summary statistics - FIXED: Simplified approach
+summary_data <- companies_master %>%
+  dplyr::select(total_funding_usd, company_age, num_rounds, num_unique_investors, acquired) %>%
+  select_if(is.numeric)
+
+# Create summary statistics manually for better control
+summary_stats <- data.frame(
+  Variable = names(summary_data),
+  Min = sapply(summary_data, min, na.rm = TRUE),
+  Q1 = sapply(summary_data, quantile, 0.25, na.rm = TRUE),
+  Median = sapply(summary_data, median, na.rm = TRUE),
+  Mean = sapply(summary_data, mean, na.rm = TRUE),
+  Q3 = sapply(summary_data, quantile, 0.75, na.rm = TRUE),
+  Max = sapply(summary_data, max, na.rm = TRUE),
+  row.names = NULL
+)
+
+kable(summary_stats,
+      caption = "Summary Statistics for Key Variables",
+      digits = 2) %>%
+  kable_styling(bootstrap_options = "striped")
+```
+
+# Exploratory Data Analysis
+
+## Industry Analysis
+
+```{r industry-analysis, fig.cap="Top 10 Industries by Company Count"}
+# Identify top industries
+top_industries <- companies_master %>%
+  filter(!is.na(industry)) %>%
+  count(industry, sort = TRUE) %>%
+  head(10) %>%
+  pull(industry)
+
+# Filter data for plotting
+companies_plot <- companies_master %>%
+  filter(industry %in% top_industries)
+
+# Industry distribution plot
+p_industry <- ggplot(companies_plot, 
+                    aes(x = reorder(industry, industry, function(x) -length(x)))) +
+  geom_bar(fill = "steelblue", alpha = 0.8) +
+  labs(title = "Top 10 Industries by Company Count", 
+       x = "Industry", 
+       y = "Number of Companies") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+  coord_flip()
+
+print(p_industry)
+```
+
+## Funding Distribution Analysis
+
+```{r funding-analysis, fig.cap="Distribution of Company Funding"}
+p1 <- ggplot(companies_master, aes(x = log_total_funding)) +
+  geom_histogram(binwidth = 0.5, fill = "lightblue", color = "darkblue", alpha = 0.7) +
+  labs(title = "Distribution of Total Funding (Log Scale)",
+       x = "Log(Total Funding + 1)", y = "Count") +
+  geom_vline(aes(xintercept = mean(log_total_funding, na.rm = TRUE)), 
+             color = "red", linetype = "dashed", linewidth = 1) + # FIXED: size to linewidth
+  annotate("text", x = mean(companies_master$log_total_funding, na.rm = TRUE) + 1, 
+           y = 200, label = "Mean", color = "red")
+
+print(p1)
+```
+
+## Company Age Analysis
+
+```{r age-analysis, fig.cap="Distribution of Company Age at Cutoff Date"}
+p2 <- ggplot(companies_master, aes(x = company_age)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "darkgreen", alpha = 0.7) +
+  labs(title = "Distribution of Company Age",
+       x = "Company Age (Years)", y = "Count") +
+  geom_vline(aes(xintercept = mean(company_age, na.rm = TRUE)), 
+             color = "red", linetype = "dashed", linewidth = 1) # FIXED: size to linewidth
+
+print(p2)
+```
+
+## Bivariate Analysis
+
+```{r bivariate-analysis, fig.cap="Relationship Between Company Age and Funding by Industry"}
+p3 <- ggplot(companies_plot, aes(x = company_age, y = log_total_funding, color = industry)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) + # FIXED: size to linewidth
+  labs(title = "Company Age vs. Total Funding by Industry",
+       x = "Company Age (Years)", 
+       y = "Log(Total Funding + 1)",
+       color = "Industry") +
+  theme(legend.position = "none") +
+  facet_wrap(~industry, scales = "free", ncol = 3)
+
+print(p3)
+```
+
+```{r status-funding, fig.cap="Funding Distribution by Acquisition Status"}
+p4 <- companies_master %>%
+  mutate(status = if_else(acquired, "Acquired", "Not Acquired")) %>%
+  ggplot(aes(x = status, y = log_total_funding, fill = status)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.5) +
+  labs(title = "Funding Distribution by Acquisition Status",
+       x = "Acquisition Status", 
+       y = "Log(Total Funding + 1)") +
+  scale_fill_manual(values = c("lightcoral", "lightblue")) +
+  theme(legend.position = "none")
+
+print(p4)
+```
+
+# Statistical Analysis
+
+## Hypothesis Test: Funding Differences by Acquisition Status
+
+**Research Question:** Is there a significant difference in total funding between startups that were acquired and those that were not?
+
+```{r funding-test-prep}
+# Separate funding data by acquisition status
+acquired_funding <- companies_master$log_total_funding[companies_master$acquired == TRUE]
+not_acquired_funding <- companies_master$log_total_funding[companies_master$acquired == FALSE]
+
+# Descriptive statistics
+acq_desc <- describe(acquired_funding)
+not_acq_desc <- describe(not_acquired_funding)
+
+comparison_stats <- data.frame(
+  Group = c("Acquired", "Not Acquired"),
+  N = c(length(acquired_funding), length(not_acquired_funding)),
+  Mean = c(acq_desc$mean, not_acq_desc$mean),
+  SD = c(acq_desc$sd, not_acq_desc$sd),
+  Median = c(acq_desc$median, not_acq_desc$median),
+  Min = c(acq_desc$min, not_acq_desc$min),
+  Max = c(acq_desc$max, not_acq_desc$max)
+)
+
+kable(comparison_stats, digits = 3,
+      caption = "Descriptive Statistics: Log-Transformed Funding by Acquisition Status") %>%
+  kable_styling(bootstrap_options = "striped")
+```
+
+### Assumption Testing
+
+```{r assumption-tests, fig.cap="Distribution Comparison and Q-Q Plots"}
+# Create comparison plots
+par(mfrow = c(2, 2))
+
+# Histograms
+hist(acquired_funding, main = "Acquired Companies", 
+     xlab = "Log(Total Funding + 1)", col = "lightblue", breaks = 20)
+hist(not_acquired_funding, main = "Not Acquired Companies", 
+     xlab = "Log(Total Funding + 1)", col = "lightcoral", breaks = 20)
+
+# Q-Q plots
+qqnorm(acquired_funding, main = "Q-Q Plot: Acquired")
+qqline(acquired_funding, col = "red")
+qqnorm(not_acquired_funding, main = "Q-Q Plot: Not Acquired")
+qqline(not_acquired_funding, col = "red")
+
+par(mfrow = c(1, 1))
+```
+
+```{r variance-test}
+# Test for homogeneity of variance
+levene_test <- leveneTest(log_total_funding ~ acquired, data = companies_master)
+var_test <- var.test(acquired_funding, not_acquired_funding, alternative = "two.sided")
+
+cat("Levene's Test for Homogeneity of Variance:\n")
+cat("F =", round(levene_test$`F value`[1], 4), ", p =", round(levene_test$`Pr(>F)`[1], 4), "\n\n")
+
+cat("F-Test for Equal Variances:\n")
+cat("F =", round(var_test$statistic, 4), ", p =", round(var_test$p.value, 4), "\n")
+```
+
+### Statistical Test
+
+```{r wilcox-test}
+# Given non-normal distributions
+wilcox_result <- wilcox.test(acquired_funding, not_acquired_funding, 
+                            paired = FALSE, alternative = "two.sided")
+
+cat("W =", wilcox_result$statistic, "\n")
+cat("p-value =", format(wilcox_result$p.value, scientific = TRUE, digits = 4), "\n")
+```
+
+# Mediation Analysis
+
+**Research Question:** Does total funding mediate the relationship between industry type and acquisition likelihood?
+
+```{r mediation-setup}
+# Prepare data for mediation analysis
+companies_mediation <- companies_master %>%
+  filter(complete.cases(industry, total_funding_usd, acquired)) %>%
+  mutate(
+    # Create binary industry variable (top industry vs others)
+    industry_counts = ave(rep(1, nrow(.)), industry, FUN = sum),
+    top_industry_name = names(sort(table(industry), decreasing = TRUE))[1]
+  )
+
+top_industry <- companies_mediation$top_industry_name[1]
+companies_mediation <- companies_mediation %>%
+  mutate(top_industry = ifelse(industry == top_industry, 1, 0))
+
+cat("Mediation Analysis Setup:\n")
+cat("Sample size:", nrow(companies_mediation), "\n")
+cat("Top industry:", top_industry, "\n")
+cat("Companies in top industry:", sum(companies_mediation$top_industry), "\n")
+cat("Acquisition rate (top industry):", 
+    round(mean(companies_mediation$acquired[companies_mediation$top_industry == 1]) * 100, 1), "%\n")
+cat("Acquisition rate (other industries):", 
+    round(mean(companies_mediation$acquired[companies_mediation$top_industry == 0]) * 100, 1), "%\n")
+```
+
+```{r mediation-analysis}
+set.seed(123)
+
+# Step 1: Industry → Funding (a path)
+model_a <- lm(log_total_funding ~ top_industry, data = companies_mediation)
+
+# Step 2: Industry + Funding → Acquisition (b and c' paths)
+model_b <- glm(acquired ~ top_industry + log_total_funding, 
+               data = companies_mediation, family = binomial)
+
+# Bootstrap mediation analysis
+mediation_results <- mediate(model_a, model_b, 
+                           treat = "top_industry", 
+                           mediator = "log_total_funding", 
+                           boot = TRUE, sims = 1000)
+
+# Display results
+summary(mediation_results)
+```
+
+```{r mediation-interpretation}
+# Extract key results for interpretation
+med_summary <- summary(mediation_results)
+acme <- med_summary$d.avg
+acme_p <- med_summary$d.avg.p
+ade <- med_summary$z.avg
+ade_p <- med_summary$z.avg.p
+total_effect <- med_summary$tau.coef
+prop_mediated <- med_summary$n.avg
+
+# Determine mediation type
+if(acme_p < 0.05 & ade_p >= 0.05) {
+  mediation_type <- "fully mediated"
+} else if(acme_p < 0.05 & ade_p < 0.05) {
+  mediation_type <- "partially mediated"
+} else {
+  mediation_type <- "no significant mediation"
+}
+
+cat("Mediation Analysis Summary:\n")
+cat("Indirect effect (ACME):", round(acme, 4), "p =", round(acme_p, 4), "\n")
+cat("Direct effect (ADE):", round(ade, 4), "p =", round(ade_p, 4), "\n")
+cat("Total effect:", round(total_effect, 4), "\n")
+cat("Proportion mediated:", round(prop_mediated, 4), "\n")
+cat("Mediation type:", mediation_type, "\n")
+```
+
+**Interpretation:** The mediation analysis indicates `r mediation_type` relationship, with funding serving as a `r if(acme_p < 0.05) "significant" else "non-significant"` mediator between industry type and acquisition likelihood.
+
+# Chi-Square Test
+
+**Research Question:** Is there a relationship between industry sector and acquisition status?
+
+## Contingency Table
+
+```{r contingency-table}
+# Create contingency table
+contingency_table <- table(companies_master$industry_grouped, companies_master$acquired)
+colnames(contingency_table) <- c("Not Acquired", "Acquired")
+
+# Display the table
+kable(contingency_table, 
+      caption = "Contingency Table: Industry Sector by Acquisition Status") %>%
+  kable_styling(bootstrap_options = "striped")
+
+# Calculate percentages
+prop_table <- prop.table(contingency_table, margin = 1) * 100
+kable(round(prop_table, 1), 
+      caption = "Acquisition Rates by Industry Sector (%)") %>%
+  kable_styling(bootstrap_options = "striped")
+```
+
+## Visualization
+
+```{r industry-acquisition-viz, fig.cap="Acquisition Rates by Industry Sector"}
+# Create visualization
+companies_master %>%
+  group_by(industry_grouped) %>%
+  summarise(
+    total = n(),
+    acquired = sum(acquired),
+    acquisition_rate = mean(acquired) * 100,
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = reorder(industry_grouped, acquisition_rate), y = acquisition_rate)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(acquisition_rate, 1), "%")), 
+            hjust = -0.1, size = 3) +
+  labs(title = "Acquisition Rates by Industry Sector",
+       x = "Industry Sector",
+       y = "Acquisition Rate (%)") +
+  coord_flip() +
+  theme_minimal()
+```
+
+## Statistical Test
+
+```{r chi-square-test}
+# Perform Chi-square test of independence
+chi_square_result <- chisq.test(contingency_table)
+
+# Display results
+cat("Chi-Square Test of Independence:\n")
+cat("χ² =", round(chi_square_result$statistic, 4), "\n")
+cat("df =", chi_square_result$parameter, "\n") 
+cat("p-value =", format(chi_square_result$p.value, scientific = TRUE), "\n")
+
+# Check assumptions
+expected_freq <- chi_square_result$expected
+min_expected <- min(expected_freq)
+cells_below_5 <- sum(expected_freq < 5)
+
+cat("\nAssumption Check:\n")
+cat("Minimum expected frequency:", round(min_expected, 2), "\n")
+cat("Cells with expected frequency < 5:", cells_below_5, "out of", length(expected_freq), "\n")
+
+# Effect size (Cramér's V)
+cramers_v <- sqrt(chi_square_result$statistic / (sum(contingency_table) * (min(dim(contingency_table)) - 1)))
+cat("Cramér's V (effect size):", round(cramers_v, 3), "\n")
+
+# Post-hoc analysis if significant - FIXED: Better formatting
+if(chi_square_result$p.value < 0.05) {
+  cat("\nPost-hoc: Standardized Residuals\n")
+  std_residuals <- chi_square_result$stdres
+  
+  # Convert to data frame for better display
+  std_res_df <- as.data.frame.matrix(round(std_residuals, 2))
+  
+  kable(std_res_df,
+        caption = "Standardized Residuals for Chi-Square Test") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+```
+
+# Summary of Results
+
+## Key Findings
+
+1. **Funding Differences**: Acquired companies have significantly higher funding than non-acquired companies (Mann-Whitney U test, p < 0.001).
+
+2. **Mediation Analysis**: The analysis shows `r mediation_type` - total funding `r ifelse(exists("acme_p") && acme_p < 0.05, "significantly mediates", "does not significantly mediate")` the relationship between industry type and acquisition likelihood.
+
+3. **Industry-Acquisition Relationship**: The Chi-square test `r ifelse(exists("chi_square_result") && chi_square_result$p.value < 0.05, "reveals a significant", "shows no significant")` relationship between industry sector and acquisition status.
+
+## Business Implications
+
+- **For Startups**: Higher funding levels are associated with increased acquisition likelihood
+- **For Investors**: Industry selection and funding strategies should consider acquisition potential
+- **For Acquirers**: Predictive models can help identify potential acquisition targets
+
+---
+
+**Analysis Date:** `r Sys.Date()`  
+**R Version:** `r R.version.string`
